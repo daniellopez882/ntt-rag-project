@@ -1,608 +1,394 @@
+"""The HTTP API.
 
-import os
+What changed, each reproduced before the change:
+
+* No route authenticated. ``X-API-Key`` is required everywhere but
+  ``/health``; without a configured key the API answers 503 (closed), not 200.
+* ``allow_origins=["*"]`` with ``allow_credentials=True`` — origins come from
+  ``CORS_ORIGINS`` and credentials are off.
+* Every error path returned ``str(e)`` to the caller, and the global handler
+  returned a Pydantic model where Starlette needs a ``Response`` (a second
+  crash on top of the first). Errors are generic JSON with a request id; the
+  detail goes to the log.
+* ``execute_agent`` caught every exception and saved
+  ``"I encountered an error… <exception>"`` as the assistant's turn. Failures
+  are failures now.
+* Any caller could continue or read any session by id. A session is bound to
+  the ``user_id`` declared when it was created.
+* ``/documents`` passed unbounded ``limit``/``offset`` to SQL.
+* ``result.data`` is ``result.output`` in the pinned pydantic-ai.
+* ``HealthStatus.llm_connection`` was hard-coded ``True``.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import Dict, Any, List, Optional
-from datetime import datetime
+import secrets
 import uuid
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-import uvicorn
-from dotenv import load_dotenv
-from pydantic_ai.messages import PartStartEvent, PartDeltaEvent, TextPartDelta
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
+from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPartDelta
 
-from .agent import rag_agent, AgentDependencies
+from .agent import AgentDependencies, get_agent
+from .config import get_settings
 from .db_utils import (
-    execute_init_sql,
-    initialize_database,
+    add_message,
     close_database,
     create_session,
+    execute_init_sql,
     get_session,
-    add_message,
     get_session_messages,
-    test_connection
+    initialize_database,
+    test_connection,
 )
 from .models import (
     ChatRequest,
     ChatResponse,
+    HealthStatus,
     SearchRequest,
     SearchResponse,
-    ErrorResponse,
-    HealthStatus,
+    SearchType,
     ToolCall,
 )
 from .tools import (
-    vector_search_tool,
+    DocumentListInput,
+    HybridSearchInput,
+    VectorSearchInput,
     hybrid_search_tool,
     list_documents_tool,
-    VectorSearchInput,
-    HybridSearchInput,
-    DocumentListInput
+    vector_search_tool,
 )
-
-# Load environment variables
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Application configuration
-APP_ENV = os.getenv("APP_ENV", "development")
-APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", 8000))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+API_VERSION = "1.2.0"
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 
-if APP_ENV == "development":
-    logger.setLevel(logging.DEBUG)
+class AgentError(RuntimeError):
+    """The agent could not produce a response."""
+
+
+# --- auth ---------------------------------------------------------------------
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(api_key: str | None = Depends(_api_key_header)) -> None:
+    settings = get_settings()
+    if not settings.auth_configured:
+        raise HTTPException(status_code=503, detail="API_KEY is not configured on this server")
+    if not api_key or not secrets.compare_digest(api_key, settings.API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# --- app --------------------------------------------------------------------------
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager"""
-    # Startup
-    logger.info("Starting up system...")
-    
-    try:
-        # Initialize database connections
-        await initialize_database()
-        await execute_init_sql("sql/schema.sql")
-
-        logger.info("Database initialized")
-                
-        # Test connections
-        db_ok = await test_connection()
-        
-        if not db_ok:
-            logger.error("Database connection failed")
-                    
-        logger.info("System startup complete")
-        
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        raise
-    
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    if not settings.auth_configured:
+        logger.warning("API_KEY is not set: every route except /health will answer 503")
+    await initialize_database()
+    await execute_init_sql("sql/schema.sql")
+    if not await test_connection():
+        logger.error("Database connection failed")
+    logger.info("Startup complete")
     yield
-    
-    # Shutdown
-    logger.info("Shutting down system...")
-    
-    try:
-        await close_database()
-        logger.info("Connections closed")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+    await close_database()
 
 
-# Create FastAPI app
-app = FastAPI(
-    title="Agentic RAG",
-    description="AI agent combining vector search",
-    version="1.1.0",
-    lifespan=lifespan
-)
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(
+        title="Agentic RAG",
+        description="A Pydantic AI agent over pgvector search",
+        version=API_VERSION,
+        lifespan=lifespan,
+    )
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type", "X-API-Key"],
+        )
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    _register_routes(app)
+    return app
 
-# Add middleware with flexible CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
 
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# --- helpers ------------------------------------------------------------------
 
 
-# Helper functions for agent execution
 async def get_or_create_session(request: ChatRequest) -> str:
-    """Get existing session or create new one."""
+    """The caller's session: an existing one they own, or a new one."""
     if request.session_id:
         session = await get_session(request.session_id)
-        if session:
+        if session and session.get("user_id") == request.user_id:
             return request.session_id
-    
-    # Create new session
+        raise HTTPException(status_code=404, detail="Session not found")
     return await create_session(
         user_id=request.user_id,
-        metadata=request.metadata
+        metadata=request.metadata,
+        timeout_minutes=get_settings().SESSION_TIMEOUT_MINUTES,
     )
 
-async def get_conversation_context(
-    session_id: str,
-    max_messages: int = 10
-) -> List[Dict[str, str]]:
-    """
-    Get recent conversation context.
-    
-    Args:
-        session_id: Session ID
-        max_messages: Maximum number of messages to retrieve
-    
-    Returns:
-        List of messages
-    """
-    messages = await get_session_messages(session_id, limit=max_messages)
-    
-    return [
-        {
-            "role": msg["role"],
-            "content": msg["content"]
-        }
-        for msg in messages
-    ]
 
-def extract_tool_calls(result) -> List[ToolCall]:
-    """
-    Extract tool calls from Pydantic AI result.
-    
-    Args:
-        result: Pydantic AI result object
-    
-    Returns:
-        List of ToolCall objects
-    """
-    tools_used = []
-    
+async def build_prompt(session_id: str, message: str) -> str:
+    """The message with the last few turns in front of it."""
+    limit = get_settings().MAX_CONTEXT_MESSAGES
+    if limit == 0:
+        return message
+    history = await get_session_messages(session_id, limit=limit)
+    if not history:
+        return message
+    context = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    return f"Previous conversation:\n{context}\n\nCurrent question: {message}"
+
+
+def result_output(result: Any) -> str:
+    """``AgentRunResult.output`` (``.data`` before pydantic-ai 0.4)."""
+    if hasattr(result, "output"):
+        return str(result.output)
+    return str(result.data)
+
+
+def extract_tool_calls(result: Any) -> list[ToolCall]:
+    calls: list[ToolCall] = []
     try:
-        # Get all messages from the result
         messages = result.all_messages()
-        
-        for message in messages:
-            if hasattr(message, 'parts'):
-                for part in message.parts:
-                    # Check if this is a tool call part
-                    if part.__class__.__name__ == 'ToolCallPart':
-                        try:
-                            # Debug logging to understand structure
-                            logger.debug(f"ToolCallPart attributes: {dir(part)}")
-                            logger.debug(f"ToolCallPart content: tool_name={getattr(part, 'tool_name', None)}")
-                            
-                            # Extract tool information safely
-                            tool_name = str(part.tool_name) if hasattr(part, 'tool_name') else 'unknown'
-                            
-                            # Get args - the args field is a JSON string in Pydantic AI
-                            tool_args = {}
-                            if hasattr(part, 'args') and part.args is not None:
-                                if isinstance(part.args, str):
-                                    # Args is a JSON string, parse it
-                                    try:
+    except Exception:
+        return calls
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if getattr(part, "part_kind", None) != "tool-call":
+                continue
+            args: Any = getattr(part, "args", {})
+            if hasattr(part, "args_as_dict"):
+                try:
+                    args = part.args_as_dict()
+                except Exception:
+                    args = {}
+            elif isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            calls.append(
+                ToolCall(
+                    tool_name=str(getattr(part, "tool_name", "unknown")),
+                    args=args if isinstance(args, dict) else {},
+                    tool_call_id=getattr(part, "tool_call_id", None),
+                )
+            )
+    return calls
 
-                                        tool_args = json.loads(part.args)
-                                        logger.debug(f"Parsed args from JSON string: {tool_args}")
-                                    except json.JSONDecodeError as e:
-                                        logger.debug(f"Failed to parse args JSON: {e}")
-                                        tool_args = {}
-                                elif isinstance(part.args, dict):
-                                    tool_args = part.args
-                                    logger.debug(f"Args already a dict: {tool_args}")
-                            
-                            
-                            # Get tool call ID
-                            tool_call_id = None
-                            if hasattr(part, 'tool_call_id'):
-                                tool_call_id = str(part.tool_call_id) if part.tool_call_id else None
-                            
-                            # Create ToolCall with explicit field mapping
-                            tool_call_data = {
-                                "tool_name": tool_name,
-                                "args": tool_args,
-                                "tool_call_id": tool_call_id
-                            }
-                            logger.debug(f"Creating ToolCall with data: {tool_call_data}")
-                            tools_used.append(ToolCall(**tool_call_data))
-                        except Exception as e:
-                            logger.debug(f"Failed to parse tool call part: {e}")
-                            continue
-    except Exception as e:
-        logger.warning(f"Failed to extract tool calls: {e}")
-    
-    return tools_used
-
-async def save_conversation_turn(
-    session_id: str,
-    user_message: str,
-    assistant_message: str,
-    metadata: Optional[Dict[str, Any]] = None
-):
-    """
-    Save a conversation turn to the database.
-    
-    Args:
-        session_id: Session ID
-        user_message: User's message
-        assistant_message: Assistant's response
-        metadata: Optional metadata
-    """
-    # Save user message
-    await add_message(
-        session_id=session_id,
-        role="user",
-        content=user_message,
-        metadata=metadata or {}
-    )
-    
-    # Save assistant message
-    await add_message(
-        session_id=session_id,
-        role="assistant",
-        content=assistant_message,
-        metadata=metadata or {}
-    )
 
 async def execute_agent(
-    message: str,
-    session_id: str,
-    user_id: Optional[str] = None,
-    save_conversation: bool = True
-) -> tuple[str, List[ToolCall]]:
-    """
-    Execute the agent with a message.
-    
-    Args:
-        message: User message
-        session_id: Session ID
-        user_id: Optional user ID
-        save_conversation: Whether to save the conversation
-    
-    Returns:
-        Tuple of (agent response, tools used)
-    """
+    message: str, session_id: str, user_id: str | None
+) -> tuple[str, list[ToolCall]]:
+    """Run the agent and persist the turn. Raises ``AgentError`` on failure."""
+    deps = AgentDependencies(session_id=session_id, user_id=user_id)
+    prompt = await build_prompt(session_id, message)
     try:
-        # Create dependencies
-        deps = AgentDependencies(
-            session_id=session_id,
-            user_id=user_id
+        result = await get_agent().run(prompt, deps=deps)
+    except Exception as exc:
+        logger.exception("Agent run failed")
+        raise AgentError("The agent could not process the request") from exc
+    response = result_output(result)
+    tools_used = extract_tool_calls(result)
+    await add_message(session_id, "user", message, {"user_id": user_id})
+    await add_message(session_id, "assistant", response, {"tool_calls": len(tools_used)})
+    return response, tools_used
+
+
+def sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+# --- routes -------------------------------------------------------------------
+
+
+def _register_routes(app: FastAPI) -> None:
+    protected = [Depends(require_api_key)]
+
+    @app.get("/health", response_model=HealthStatus)
+    async def health_check() -> Any:
+        settings = get_settings()
+        db_ok = await test_connection()
+        status = HealthStatus(
+            status="healthy" if db_ok else "unhealthy",
+            database=db_ok,
+            llm_configured=settings.llm_configured,
+            auth_configured=settings.auth_configured,
+            version=API_VERSION,
+            timestamp=datetime.now(),
         )
-        
-        # Get conversation context
-        context = await get_conversation_context(session_id)
-        
-        # Build prompt with context
-        full_prompt = message
-        if context:
-            context_str = "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in context[-6:]  # Last 3 turns
-            ])
-            full_prompt = f"Previous conversation:\n{context_str}\n\nCurrent question: {message}"
-        
-        # Run the agent
-        result = await rag_agent.run(full_prompt, deps=deps)
-        
-        response = result.data
-        tools_used = extract_tool_calls(result)
-        
-        # Save conversation if requested
-        if save_conversation:
-            await save_conversation_turn(
-                session_id=session_id,
-                user_message=message,
-                assistant_message=response,
-                metadata={
-                    "user_id": user_id,
-                    "tool_calls": len(tools_used)
-                }
-            )
-        
-        return response, tools_used
-        
-    except Exception as e:
-        logger.error(f"Agent execution failed: {e}")
-        error_response = f"I encountered an error while processing your request: {str(e)}"
-        
-        if save_conversation:
-            await save_conversation_turn(
-                session_id=session_id,
-                user_message=message,
-                assistant_message=error_response,
-                metadata={"error": str(e)}
-            )
-        
-        return error_response, []
+        if not db_ok:
+            return JSONResponse(status_code=503, content=status.model_dump(mode="json"))
+        return status
 
-
-# API Endpoints
-
-@app.get("/health", response_model=HealthStatus)
-async def health_check():
-    """Health check endpoint."""
-    try:
-        # Test database connections
-        db_status = await test_connection()
-        # Determine overall status
-        if db_status:
-            status = "healthy"
-        else:
-            status = "unhealthy"
-        
-        return HealthStatus(
-            status=status,
-            database=db_status,
-            llm_connection=True, 
-            version="1.1.0",
-            timestamp=datetime.now()
-        )
-        
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=500, detail="Health check failed")
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Non-streaming chat endpoint."""
-    try:
-        # Get or create session
+    @app.post("/chat", response_model=ChatResponse, dependencies=protected)
+    async def chat(request: ChatRequest) -> ChatResponse:
         session_id = await get_or_create_session(request)
-        
-        # Execute agent
-        response, tools_used = await execute_agent(
-            message=request.message,
-            session_id=session_id,
-            user_id=request.user_id
-        )
-        
+        try:
+            response, tools_used = await execute_agent(request.message, session_id, request.user_id)
+        except AgentError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return ChatResponse(
             message=response,
             session_id=session_id,
             tools_used=tools_used,
-            metadata={"search_type": str(request.search_type)}
+            metadata={"search_type": str(request.search_type)},
         )
-        
-    except Exception as e:
-        logger.error(f"Chat endpoint failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """Streaming chat endpoint using Server-Sent Events."""
-    try:
-        # Get or create session
+    @app.post("/chat/stream", dependencies=protected)
+    async def chat_stream(request: ChatRequest) -> StreamingResponse:
         session_id = await get_or_create_session(request)
-        
-        async def generate_stream():
-            """Generate streaming response using agent.iter() pattern."""
+        prompt = await build_prompt(session_id, request.message)
+        deps = AgentDependencies(session_id=session_id, user_id=request.user_id)
+        agent = get_agent()
+
+        async def generate() -> AsyncIterator[str]:
+            yield sse({"type": "session", "session_id": session_id})
+            full_response = ""
             try:
-                yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
-                
-                # Create dependencies
-                deps = AgentDependencies(
-                    session_id=session_id,
-                    user_id=request.user_id
-                )
-                
-                # Get conversation context
-                context = await get_conversation_context(session_id)
-                
-                # Build input with context
-                full_prompt = request.message
-                if context:
-                    context_str = "\n".join([
-                        f"{msg['role']}: {msg['content']}"
-                        for msg in context[-6:]
-                    ])
-                    full_prompt = f"Previous conversation:\n{context_str}\n\nCurrent question: {request.message}"
-                
-                # Save user message
-                await add_message(
-                    session_id=session_id,
-                    role="user",
-                    content=request.message,
-                    metadata={"user_id": request.user_id}
-                )
-                
-                full_response = ""
-                
-                async with rag_agent.iter(full_prompt, deps=deps) as run:
+                await add_message(session_id, "user", request.message, {"user_id": request.user_id})
+                async with agent.iter(prompt, deps=deps) as run:
                     async for node in run:
-                        if rag_agent.is_model_request_node(node):
-                            async with node.stream(run.ctx) as request_stream:
-                                async for event in request_stream:
-                                    
-                                    if isinstance(event, PartStartEvent) and event.part.part_kind == 'text':
-                                        delta_content = event.part.content
-                                        yield f"data: {json.dumps({'type': 'text', 'content': delta_content})}\n\n"
-                                        full_response += delta_content
-                                        
-                                    elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                                        delta_content = event.delta.content_delta
-                                        yield f"data: {json.dumps({'type': 'text', 'content': delta_content})}\n\n"
-                                        full_response += delta_content
-                
-                # Extract tools used from the final result
-                result = run.result
-                tools_used = extract_tool_calls(result)
-                
-                # Send tools used information
+                        if not agent.is_model_request_node(node):
+                            continue
+                        async with node.stream(run.ctx) as stream:
+                            async for event in stream:
+                                delta = None
+                                if (
+                                    isinstance(event, PartStartEvent)
+                                    and event.part.part_kind == "text"
+                                ):
+                                    delta = event.part.content
+                                elif isinstance(event, PartDeltaEvent) and isinstance(
+                                    event.delta, TextPartDelta
+                                ):
+                                    delta = event.delta.content_delta
+                                if delta:
+                                    full_response += delta
+                                    yield sse({"type": "text", "content": delta})
+                tools_used = extract_tool_calls(run.result)
                 if tools_used:
-                    tools_data = [
-                        {
-                            "tool_name": tool.tool_name,
-                            "args": tool.args,
-                            "tool_call_id": tool.tool_call_id
-                        }
-                        for tool in tools_used
-                    ]
-                    yield f"data: {json.dumps({'type': 'tools', 'tools': tools_data})}\n\n"
-                
-                # Save assistant response
+                    yield sse({"type": "tools", "tools": [t.model_dump() for t in tools_used]})
                 await add_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=full_response,
-                    metadata={
-                        "streamed": True,
-                        "tool_calls": len(tools_used)
-                    }
+                    session_id,
+                    "assistant",
+                    full_response,
+                    {"streamed": True, "tool_calls": len(tools_used)},
                 )
-                
-                yield f"data: {json.dumps({'type': 'end'})}\n\n"
-                
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                error_chunk = {
-                    "type": "error",
-                    "content": f"Stream error: {str(e)}"
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-        
+                yield sse({"type": "end"})
+            except Exception:
+                logger.exception("Stream failed")
+                yield sse({"type": "error", "content": "The agent could not process the request"})
+
         return StreamingResponse(
-            generate_stream(),
-            media_type="text/plain",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "text/event-stream"
-            }
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-        
-    except Exception as e:
-        logger.error(f"Streaming chat failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/search/vector")
-async def search_vector(request: SearchRequest):
-    """Vector search endpoint."""
-    try:
-        input_data = VectorSearchInput(
-            query=request.query,
-            limit=request.limit
-        )
-        
-        start_time = datetime.now()
-        results = await vector_search_tool(input_data)
-        end_time = datetime.now()
-        
-        query_time = (end_time - start_time).total_seconds() * 1000
-        
+    @app.post("/search/vector", response_model=SearchResponse, dependencies=protected)
+    async def search_vector(request: SearchRequest) -> SearchResponse:
+        started = datetime.now()
+        try:
+            results = await vector_search_tool(
+                VectorSearchInput(query=request.query, limit=request.limit)
+            )
+        except Exception as exc:
+            logger.exception("Vector search failed")
+            raise HTTPException(status_code=502, detail="Search failed") from exc
         return SearchResponse(
             results=results,
             total_results=len(results),
-            search_type="vector",
-            query_time_ms=query_time
+            search_type=SearchType.VECTOR,
+            query_time_ms=(datetime.now() - started).total_seconds() * 1000,
         )
-        
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/search/hybrid")
-async def search_hybrid(request: SearchRequest):
-    """Hybrid search endpoint."""
-    try:
-        input_data = HybridSearchInput(
-            query=request.query,
-            limit=request.limit,
-            text_weight=0.3
-        )
-        
-        start_time = datetime.now()
-        results = await hybrid_search_tool(input_data)
-        end_time = datetime.now()
-        
-        query_time = (end_time - start_time).total_seconds() * 1000
-        
+    @app.post("/search/hybrid", response_model=SearchResponse, dependencies=protected)
+    async def search_hybrid(request: SearchRequest) -> SearchResponse:
+        started = datetime.now()
+        try:
+            results = await hybrid_search_tool(
+                HybridSearchInput(query=request.query, limit=request.limit, text_weight=0.3)
+            )
+        except Exception as exc:
+            logger.exception("Hybrid search failed")
+            raise HTTPException(status_code=502, detail="Search failed") from exc
         return SearchResponse(
             results=results,
             total_results=len(results),
-            search_type="hybrid",
-            query_time_ms=query_time
+            search_type=SearchType.HYBRID,
+            query_time_ms=(datetime.now() - started).total_seconds() * 1000,
         )
-        
-    except Exception as e:
-        logger.error(f"Hybrid search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/documents", dependencies=protected)
+    async def list_documents_endpoint(
+        limit: int = Query(default=20, ge=1, le=100), offset: int = Query(default=0, ge=0)
+    ) -> dict[str, Any]:
+        try:
+            documents = await list_documents_tool(DocumentListInput(limit=limit, offset=offset))
+        except Exception as exc:
+            logger.exception("Document listing failed")
+            raise HTTPException(status_code=502, detail="Document listing failed") from exc
+        return {"documents": documents, "total": len(documents), "limit": limit, "offset": offset}
 
-@app.get("/documents")
-async def list_documents_endpoint(
-    limit: int = 20,
-    offset: int = 0
-):
-    """List documents endpoint."""
-    try:
-        input_data = DocumentListInput(limit=limit, offset=offset)
-        documents = await list_documents_tool(input_data)
-        
-        return {
-            "documents": documents,
-            "total": len(documents),
-            "limit": limit,
-            "offset": offset
-        }
-        
-    except Exception as e:
-        logger.error(f"Document listing failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/sessions/{session_id}")
-async def get_session_info(session_id: str):
-    """Get session information."""
-    try:
+    @app.get("/sessions/{session_id}", dependencies=protected)
+    async def get_session_info(session_id: str, user_id: str | None = None) -> dict[str, Any]:
+        try:
+            uuid.UUID(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
         session = await get_session(session_id)
-        if not session:
+        if not session or session.get("user_id") != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
-        
         return session
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Session retrieval failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        request_id = str(uuid.uuid4())
+        logger.error("Unhandled exception [%s]: %s", request_id, exc, exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal server error",
+                "error_type": "InternalError",
+                "request_id": request_id,
+            },
+        )
 
 
-# Exception handlers
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}")
-    
-    return ErrorResponse(
-        error=str(exc),
-        error_type=type(exc).__name__,
-        request_id=str(uuid.uuid4())
-    )
+app = create_app()
 
 
-# Run the app with Uvicorn
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+
+    settings = get_settings()
     uvicorn.run(
         "agent.api:app",
-        host=APP_HOST,
-        port=APP_PORT,
-        reload=APP_ENV == "development",
-        log_level=LOG_LEVEL.lower()
+        host=settings.APP_HOST,
+        port=settings.APP_PORT,
+        reload=not settings.is_production,
+        log_level=settings.LOG_LEVEL.lower(),
     )

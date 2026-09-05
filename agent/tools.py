@@ -1,201 +1,115 @@
+"""Search and document tools, shared by the agent and the API.
+
+Inputs are bounded (the old models accepted any ``limit``; ``/documents``
+would pass 10**9 straight to ``LIMIT``), document ids must be UUIDs before
+they reach ``::uuid`` casts, and the embedding client is created on first
+use — the old module built it at import, so nothing here could be imported
+without an OpenAI key. These functions raise on failure; the agent-facing
+wrappers in ``agent.py`` decide what the model sees.
+"""
+
+from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any, Optional
 from datetime import datetime
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator
 
 from .db_utils import (
-    vector_search,
-    hybrid_search,
     get_document,
+    get_document_chunks,
+    hybrid_search,
     list_documents,
-    get_document_chunks
+    vector_search,
 )
 from .models import ChunkResult, DocumentMetadata
 from .providers import get_embedding_client, get_embedding_model
 
-# Load environment variables
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-# Initialize embedding client with flexible provider
-embedding_client = get_embedding_client()
-EMBEDDING_MODEL = get_embedding_model()
+MAX_SEARCH_LIMIT = 50
+MAX_LIST_LIMIT = 100
 
 
-async def generate_embedding(text: str) -> List[float]:
-    """
-    Generate embedding for text using OpenAI.
-    
-    Args:
-        text: Text to embed
-    
-    Returns:
-        Embedding vector
-    """
-    try:
-        response = await embedding_client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        logger.error(f"Failed to generate embedding: {e}")
-        raise
+async def generate_embedding(text: str) -> list[float]:
+    response = await get_embedding_client().embeddings.create(
+        model=get_embedding_model(), input=text
+    )
+    return response.data[0].embedding
 
-# Tool Input Models
+
 class VectorSearchInput(BaseModel):
-    """Input for vector search tool."""
-    query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, description="Maximum number of results")
-class HybridSearchInput(BaseModel):
-    """Input for hybrid search tool."""
-    query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, description="Maximum number of results")
-    text_weight: float = Field(default=0.3, description="Weight for text similarity (0-1)")
+    query: str = Field(..., min_length=1, max_length=4000, description="Search query")
+    limit: int = Field(default=10, ge=1, le=MAX_SEARCH_LIMIT)
+
+
+class HybridSearchInput(VectorSearchInput):
+    text_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+
+
 class DocumentInput(BaseModel):
-    """Input for document retrieval."""
-    document_id: str = Field(..., description="Document ID to retrieve")
+    document_id: str = Field(..., description="Document UUID")
+
+    @field_validator("document_id")
+    @classmethod
+    def _must_be_uuid(cls, value: str) -> str:
+        return str(UUID(value))
+
+
 class DocumentListInput(BaseModel):
-    """Input for listing documents."""
-    limit: int = Field(default=20, description="Maximum number of documents")
-    offset: int = Field(default=0, description="Number of documents to skip")
+    limit: int = Field(default=20, ge=1, le=MAX_LIST_LIMIT)
+    offset: int = Field(default=0, ge=0)
 
-# Tool Implementation Functions
-async def vector_search_tool(input_data: VectorSearchInput) -> List[ChunkResult]:
-    """
-    Perform vector similarity search.
-    
-    Args:
-        input_data: Search parameters
-    
-    Returns:
-        List of matching chunks
-    """
-    try:
-        # Generate embedding for the query
-        embedding = await generate_embedding(input_data.query)
-        
-        # Perform vector search
-        results = await vector_search(
-            embedding=embedding,
-            limit=input_data.limit
+
+def _chunk(row: dict[str, Any], score_key: str) -> ChunkResult:
+    return ChunkResult(
+        chunk_id=str(row["chunk_id"]),
+        document_id=str(row["document_id"]),
+        content=row["content"],
+        score=row[score_key],
+        metadata=row["metadata"],
+        document_title=row["document_title"],
+        document_source=row["document_source"],
+    )
+
+
+async def vector_search_tool(input_data: VectorSearchInput) -> list[ChunkResult]:
+    embedding = await generate_embedding(input_data.query)
+    rows = await vector_search(embedding=embedding, limit=input_data.limit)
+    return [_chunk(r, "similarity") for r in rows]
+
+
+async def hybrid_search_tool(input_data: HybridSearchInput) -> list[ChunkResult]:
+    embedding = await generate_embedding(input_data.query)
+    rows = await hybrid_search(
+        embedding=embedding,
+        query_text=input_data.query,
+        limit=input_data.limit,
+        text_weight=input_data.text_weight,
+    )
+    return [_chunk(r, "combined_score") for r in rows]
+
+
+async def get_document_tool(input_data: DocumentInput) -> dict[str, Any] | None:
+    document = await get_document(input_data.document_id)
+    if document:
+        document["chunks"] = await get_document_chunks(input_data.document_id)
+    return document
+
+
+async def list_documents_tool(input_data: DocumentListInput) -> list[DocumentMetadata]:
+    rows = await list_documents(limit=input_data.limit, offset=input_data.offset)
+    return [
+        DocumentMetadata(
+            id=d["id"],
+            title=d["title"],
+            source=d["source"],
+            metadata=d["metadata"],
+            created_at=datetime.fromisoformat(d["created_at"]),
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            chunk_count=d.get("chunk_count"),
         )
-
-        # Convert to ChunkResult models
-        return [
-            ChunkResult(
-                chunk_id=str(r["chunk_id"]),
-                document_id=str(r["document_id"]),
-                content=r["content"],
-                score=r["similarity"],
-                metadata=r["metadata"],
-                document_title=r["document_title"],
-                document_source=r["document_source"]
-            )
-            for r in results
-        ]
-        
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}")
-        return []
-
-async def hybrid_search_tool(input_data: HybridSearchInput) -> List[ChunkResult]:
-    """
-    Perform hybrid search (vector + keyword).
-    
-    Args:
-        input_data: Search parameters
-    
-    Returns:
-        List of matching chunks
-    """
-    try:
-        # Generate embedding for the query
-        embedding = await generate_embedding(input_data.query)
-        
-        # Perform hybrid search
-        results = await hybrid_search(
-            embedding=embedding,
-            query_text=input_data.query,
-            limit=input_data.limit,
-            text_weight=input_data.text_weight
-        )
-        
-        # Convert to ChunkResult models
-        return [
-            ChunkResult(
-                chunk_id=str(r["chunk_id"]),
-                document_id=str(r["document_id"]),
-                content=r["content"],
-                score=r["combined_score"],
-                metadata=r["metadata"],
-                document_title=r["document_title"],
-                document_source=r["document_source"]
-            )
-            for r in results
-        ]
-        
-    except Exception as e:
-        logger.error(f"Hybrid search failed: {e}")
-        return []
-
-async def get_document_tool(input_data: DocumentInput) -> Optional[Dict[str, Any]]:
-    """
-    Retrieve a complete document.
-    
-    Args:
-        input_data: Document retrieval parameters
-    
-    Returns:
-        Document data or None
-    """
-    try:
-        document = await get_document(input_data.document_id)
-        
-        if document:
-            chunks = await get_document_chunks(input_data.document_id)
-            document["chunks"] = chunks
-        
-        return document
-        
-    except Exception as e:
-        logger.error(f"Document retrieval failed: {e}")
-        return None
-
-async def list_documents_tool(input_data: DocumentListInput) -> List[DocumentMetadata]:
-    """
-    List available documents.
-    
-    Args:
-        input_data: Listing parameters
-    
-    Returns:
-        List of document metadata
-    """
-    try:
-        documents = await list_documents(
-            limit=input_data.limit,
-            offset=input_data.offset
-        )
-        
-        # Convert to DocumentMetadata models
-        return [
-            DocumentMetadata(
-                id=d["id"],
-                title=d["title"],
-                source=d["source"],
-                metadata=d["metadata"],
-                created_at=datetime.fromisoformat(d["created_at"]),
-                updated_at=datetime.fromisoformat(d["updated_at"]),
-                chunk_count=d.get("chunk_count")
-            )
-            for d in documents
-        ]
-        
-    except Exception as e:
-        logger.error(f"Document listing failed: {e}")
-        return []
-
+        for d in rows
+    ]

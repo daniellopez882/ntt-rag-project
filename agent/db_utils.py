@@ -1,43 +1,31 @@
-
-import os
 import json
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
 import logging
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import asyncpg
 from asyncpg.pool import Pool
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class DatabasePool:
     """Manages PostgreSQL connection pool."""
-    
-    def __init__(self, database_url: Optional[str] = None):
+
+    def __init__(self, database_url: str | None = None):
         """
         Initialize database pool.
-        
+
         Args:
             database_url: PostgreSQL connection URL
         """
-        USER = os.getenv("DB_USER", "postgres")
-        PASSWORD = os.getenv("DB_PASSWORD", "postgres")
-        HOST = os.getenv("DB_HOST", "postgres")
-        PORT = os.getenv("DB_PORT", 5432)
-        DBNAME = os.getenv("DB_NAME", "postgres")
+        self.database_url = database_url or get_settings().database_url
 
-        self.database_url = database_url  or f"postgresql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DBNAME}"
-        if not self.database_url:
-            raise ValueError("DATABASE_URL environment variable not set")
-        
-        self.pool: Optional[Pool] = None
-    
+        self.pool: Pool | None = None
+
     async def initialize(self):
         """Create connection pool."""
         if not self.pool:
@@ -46,36 +34,40 @@ class DatabasePool:
                 min_size=5,
                 max_size=20,
                 max_inactive_connection_lifetime=300,
-                command_timeout=60
+                command_timeout=60,
             )
             logger.info("Database connection pool initialized")
-    
+
     async def close(self):
         """Close connection pool."""
         if self.pool:
             await self.pool.close()
             self.pool = None
             logger.info("Database connection pool closed")
-    
+
     @asynccontextmanager
     async def acquire(self):
         """Acquire a connection from the pool."""
         if not self.pool:
             await self.initialize()
-        
+        assert self.pool is not None
         async with self.pool.acquire() as connection:
             yield connection
 
+
 # Global database pool instance
 db_pool = DatabasePool()
+
 
 async def initialize_database():
     """Initialize database connection pool."""
     await db_pool.initialize()
 
+
 async def close_database():
     """Close database connection pool."""
     await db_pool.close()
+
 
 async def execute_init_sql(sql_path: str):
     async with db_pool.acquire() as conn:
@@ -86,36 +78,37 @@ async def execute_init_sql(sql_path: str):
                 WHERE table_name = 'documents'
             ) AS exists
         """)
-        
+
         if row["exists"]:
             logger.info("Schema already initialized, skipping.")
             return
 
-        with open(sql_path, 'r') as file:
+        with open(sql_path) as file:
             sql = file.read()
             await conn.execute(sql)
             logger.info("Schema created successfully.")
 
+
 # Session Management Functions
 async def create_session(
-    user_id: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-    timeout_minutes: int = 60
+    user_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    timeout_minutes: int = 60,
 ) -> str:
     """
     Create a new session.
-    
+
     Args:
         user_id: Optional user identifier
         metadata: Optional session metadata
         timeout_minutes: Session timeout in minutes
-    
+
     Returns:
         Session ID
     """
     async with db_pool.acquire() as conn:
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)
-        
+        expires_at = datetime.now(UTC) + timedelta(minutes=timeout_minutes)
+
         result = await conn.fetchrow(
             """
             INSERT INTO sessions (user_id, metadata, expires_at)
@@ -124,18 +117,19 @@ async def create_session(
             """,
             user_id,
             json.dumps(metadata or {}),
-            expires_at
+            expires_at,
         )
-        
+
         return result["id"]
 
-async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+
+async def get_session(session_id: str) -> dict[str, Any] | None:
     """
     Get session by ID.
-    
+
     Args:
         session_id: Session UUID
-    
+
     Returns:
         Session data or None if not found/expired
     """
@@ -153,9 +147,9 @@ async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
             WHERE id = $1::uuid
             AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
             """,
-            session_id
+            session_id,
         )
-        
+
         if result:
             return {
                 "id": result["id"],
@@ -163,27 +157,25 @@ async def get_session(session_id: str) -> Optional[Dict[str, Any]]:
                 "metadata": json.loads(result["metadata"]),
                 "created_at": result["created_at"].isoformat(),
                 "updated_at": result["updated_at"].isoformat(),
-                "expires_at": result["expires_at"].isoformat() if result["expires_at"] else None
+                "expires_at": result["expires_at"].isoformat() if result["expires_at"] else None,
             }
-        
+
         return None
+
 
 # Message Management Functions
 async def add_message(
-    session_id: str,
-    role: str,
-    content: str,
-    metadata: Optional[Dict[str, Any]] = None
+    session_id: str, role: str, content: str, metadata: dict[str, Any] | None = None
 ) -> str:
     """
     Add a message to a session.
-    
+
     Args:
         session_id: Session UUID
         role: Message role (user/assistant/system)
         content: Message content
         metadata: Optional message metadata
-    
+
     Returns:
         Message ID
     """
@@ -197,22 +189,20 @@ async def add_message(
             session_id,
             role,
             content,
-            json.dumps(metadata or {})
+            json.dumps(metadata or {}),
         )
-        
+
         return result["id"]
 
-async def get_session_messages(
-    session_id: str,
-    limit: Optional[int] = None
-) -> List[Dict[str, Any]]:
+
+async def get_session_messages(session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     """
     Get messages for a session.
-    
+
     Args:
         session_id: Session UUID
         limit: Maximum number of messages to return
-    
+
     Returns:
         List of messages ordered by creation time
     """
@@ -228,31 +218,34 @@ async def get_session_messages(
             WHERE session_id = $1::uuid
             ORDER BY created_at
         """
-        
+
         if limit:
-            query += f" LIMIT {limit}"
-        
-        results = await conn.fetch(query, session_id)
-        
+            query += " LIMIT $2"  # was an f-string interpolation
+
+        results = await (
+            conn.fetch(query, session_id, limit) if limit else conn.fetch(query, session_id)
+        )
+
         return [
             {
                 "id": row["id"],
                 "role": row["role"],
                 "content": row["content"],
                 "metadata": json.loads(row["metadata"]),
-                "created_at": row["created_at"].isoformat()
+                "created_at": row["created_at"].isoformat(),
             }
             for row in results
         ]
 
+
 # Document Management Functions
-async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
+async def get_document(document_id: str) -> dict[str, Any] | None:
     """
     Get document by ID.
-    
+
     Args:
         document_id: Document UUID
-    
+
     Returns:
         Document data or None if not found
     """
@@ -270,9 +263,9 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
             FROM documents
             WHERE id = $1::uuid
             """,
-            document_id
+            document_id,
         )
-        
+
         if result:
             return {
                 "id": result["id"],
@@ -281,25 +274,23 @@ async def get_document(document_id: str) -> Optional[Dict[str, Any]]:
                 "content": result["content"],
                 "metadata": json.loads(result["metadata"]),
                 "created_at": result["created_at"].isoformat(),
-                "updated_at": result["updated_at"].isoformat()
+                "updated_at": result["updated_at"].isoformat(),
             }
-        
+
         return None
 
 
 async def list_documents(
-    limit: int = 100,
-    offset: int = 0,
-    metadata_filter: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
+    limit: int = 100, offset: int = 0, metadata_filter: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """
     List documents with optional filtering.
-    
+
     Args:
         limit: Maximum number of documents to return
         offset: Number of documents to skip
         metadata_filter: Optional metadata filter
-    
+
     Returns:
         List of documents
     """
@@ -316,27 +307,27 @@ async def list_documents(
             FROM documents d
             LEFT JOIN chunks c ON d.id = c.document_id
         """
-        
-        params = []
-        conditions = []
-        
+
+        params: list[Any] = []
+        conditions: list[str] = []
+
         if metadata_filter:
             conditions.append(f"d.metadata @> ${len(params) + 1}::jsonb")
             params.append(json.dumps(metadata_filter))
-        
+
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        
-        query += """
+
+        query += f"""
             GROUP BY d.id, d.title, d.source, d.metadata, d.created_at, d.updated_at
             ORDER BY d.created_at DESC
-            LIMIT $%d OFFSET $%d
-        """ % (len(params) + 1, len(params) + 2)
-        
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        """
+
         params.extend([limit, offset])
-        
+
         results = await conn.fetch(query, *params)
-        
+
         return [
             {
                 "id": row["id"],
@@ -345,34 +336,30 @@ async def list_documents(
                 "metadata": json.loads(row["metadata"]),
                 "created_at": row["created_at"].isoformat(),
                 "updated_at": row["updated_at"].isoformat(),
-                "chunk_count": row["chunk_count"]
+                "chunk_count": row["chunk_count"],
             }
             for row in results
         ]
 
+
 # Vector Search Functions
-async def vector_search(
-    embedding: List[float],
-    limit: int = 10
-) -> List[Dict[str, Any]]:
+async def vector_search(embedding: list[float], limit: int = 10) -> list[dict[str, Any]]:
     """
     Perform vector similarity search.
-    
+
     Args:
         embedding: Query embedding vector
         limit: Maximum number of results
-    
+
     Returns:
         List of matching chunks ordered by similarity (best first)
     """
     async with db_pool.acquire() as conn:
-        embedding_str = '[' + ','.join(map(str, embedding)) + ']'
+        embedding_str = "[" + ",".join(map(str, embedding)) + "]"
         results = await conn.fetch(
-            "SELECT * FROM match_chunks($1::vector, $2)",
-            embedding_str,
-            limit
+            "SELECT * FROM match_chunks($1::vector, $2)", embedding_str, limit
         )
-        
+
         return [
             {
                 "chunk_id": row["chunk_id"],
@@ -381,40 +368,38 @@ async def vector_search(
                 "similarity": row["similarity"],
                 "metadata": json.loads(row["metadata"]),
                 "document_title": row["document_title"],
-                "document_source": row["document_source"]
+                "document_source": row["document_source"],
             }
             for row in results
         ]
 
+
 async def hybrid_search(
-    embedding: List[float],
-    query_text: str,
-    limit: int = 10,
-    text_weight: float = 0.3
-) -> List[Dict[str, Any]]:
+    embedding: list[float], query_text: str, limit: int = 10, text_weight: float = 0.3
+) -> list[dict[str, Any]]:
     """
     Perform hybrid search (vector + keyword).
-    
+
     Args:
         embedding: Query embedding vector
         query_text: Query text for keyword search
         limit: Maximum number of results
         text_weight: Weight for text similarity (0-1)
-    
+
     Returns:
         List of matching chunks ordered by combined score (best first)
     """
     async with db_pool.acquire() as conn:
-        embedding_str = '[' + ','.join(map(str, embedding)) + ']'
-        
+        embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+
         results = await conn.fetch(
             "SELECT * FROM hybrid_search($1::vector, $2, $3, $4)",
             embedding_str,
             query_text,
             limit,
-            text_weight
+            text_weight,
         )
-        
+
         return [
             {
                 "chunk_id": row["chunk_id"],
@@ -425,42 +410,41 @@ async def hybrid_search(
                 "text_similarity": row["text_similarity"],
                 "metadata": json.loads(row["metadata"]),
                 "document_title": row["document_title"],
-                "document_source": row["document_source"]
+                "document_source": row["document_source"],
             }
             for row in results
         ]
 
+
 # Chunk Management Functions
-async def get_document_chunks(document_id: str) -> List[Dict[str, Any]]:
+async def get_document_chunks(document_id: str) -> list[dict[str, Any]]:
     """
     Get all chunks for a document.
-    
+
     Args:
         document_id: Document UUID
-    
+
     Returns:
         List of chunks ordered by chunk index
     """
     async with db_pool.acquire() as conn:
-        results = await conn.fetch(
-            "SELECT * FROM get_document_chunks($1::uuid)",
-            document_id
-        )
-        
+        results = await conn.fetch("SELECT * FROM get_document_chunks($1::uuid)", document_id)
+
         return [
             {
                 "chunk_id": row["chunk_id"],
                 "content": row["content"],
                 "chunk_index": row["chunk_index"],
-                "metadata": json.loads(row["metadata"])
+                "metadata": json.loads(row["metadata"]),
             }
             for row in results
         ]
 
+
 async def test_connection() -> bool:
     """
     Test database connection.
-    
+
     Returns:
         True if connection successful
     """
