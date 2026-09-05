@@ -93,7 +93,10 @@ Ingest PDFs from `./documents`:
 docker compose run --rm ingest --documents documents      # or: uv sync --extra ingest && python -m ingestion.ingest
 ```
 
-UI: `docker compose up -d ui` → <http://localhost:8501>. Tests and checks:
+UI: `docker compose up -d ui` → <http://localhost:8501>. Hot reload for
+development: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up`
+(the old auto-loaded override mounted the tree over the image's virtualenv and
+broke every `up`). Tests and checks:
 
 ```bash
 uv run pytest -q && uv run ruff check . && uv run mypy agent
@@ -129,6 +132,7 @@ uv run pytest -q && uv run ruff check . && uv run mypy agent
 | 12 | A converter init failure was logged and swallowed; the chunker needed an OpenAI key even for recursive splitting; `IngestionResult` was built with fields it does not have | Ingestion failed later with unrelated errors |
 | 13 | A global `filterwarnings("ignore")` at import; compose published PostgreSQL on the host with password `postgres` | Hidden warnings; an exposed database |
 | 14 | No tests, no CI | Nothing checked anything |
+| 15 | `docker-compose.override.yml` (auto-loaded) mounted the tree over `/app` and ran a bare `uvicorn` | Every `docker compose up` started an API container that died with *executable file not found*; the override is an explicit `docker-compose.dev.yml` now |
 
 ## Design notes
 
