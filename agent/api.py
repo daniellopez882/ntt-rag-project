@@ -39,7 +39,7 @@ from fastapi.security import APIKeyHeader
 from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPartDelta
 
 from .agent import AgentDependencies, get_agent
-from .config import get_settings
+from .config import ConfigurationError, get_settings
 from .db_utils import (
     add_message,
     close_database,
@@ -207,6 +207,8 @@ async def execute_agent(
     prompt = await build_prompt(session_id, message)
     try:
         result = await get_agent().run(prompt, deps=deps)
+    except ConfigurationError:
+        raise
     except Exception as exc:
         logger.exception("Agent run failed")
         raise AgentError("The agent could not process the request") from exc
@@ -248,6 +250,10 @@ def _register_routes(app: FastAPI) -> None:
         session_id = await get_or_create_session(request)
         try:
             response, tools_used = await execute_agent(request.message, session_id, request.user_id)
+        except ConfigurationError as exc:
+            raise HTTPException(
+                status_code=503, detail="The model provider is not configured"
+            ) from exc
         except AgentError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return ChatResponse(
@@ -262,7 +268,12 @@ def _register_routes(app: FastAPI) -> None:
         session_id = await get_or_create_session(request)
         prompt = await build_prompt(session_id, request.message)
         deps = AgentDependencies(session_id=session_id, user_id=request.user_id)
-        agent = get_agent()
+        try:
+            agent = get_agent()
+        except ConfigurationError as exc:
+            raise HTTPException(
+                status_code=503, detail="The model provider is not configured"
+            ) from exc
 
         async def generate() -> AsyncIterator[str]:
             yield sse({"type": "session", "session_id": session_id})

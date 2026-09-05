@@ -266,3 +266,19 @@ def test_extract_tool_calls_parses_json_args_and_skips_text_parts():
 
 def test_fake_agent_is_used_only_in_tests():
     assert isinstance(FakeAgent(), FakeAgent)
+
+
+def test_chat_without_a_configured_model_is_a_503_not_a_generic_502(db, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from agent import agent as agent_module
+
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    reload_settings()
+    agent_module.set_agent(None)  # force the real builder, which needs the key
+    client = TestClient(api.app, raise_server_exceptions=False)
+    res = client.post("/chat", json={"message": "hi", "user_id": "u"}, headers=AUTH)
+    assert res.status_code == 503
+    assert res.json()["detail"] == "The model provider is not configured"
+    res = client.post("/chat/stream", json={"message": "hi", "user_id": "u"}, headers=AUTH)
+    assert res.status_code == 503
