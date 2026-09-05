@@ -24,7 +24,7 @@ code is specific to them beyond the system prompt.
 |---|---|
 | **Is** | An API (`/chat`, `/chat/stream`, `/search/vector`, `/search/hybrid`, `/documents`, `/sessions/{id}`, `/health`) + a UI + an ingestion CLI, in one package with three dependency groups |
 | **Auth** | `X-API-Key` on every route but `/health`; **503 until a key is configured** (fails closed); CORS from `CORS_ORIGINS`; sessions bound to the caller that created them |
-| **Tests** | 30 — API handlers with stubbed database functions and a fake agent; settings and input bounds; the ingestion pipeline with a fake extractor (3 tests need the `ingest` extra and run in their own CI job). No PostgreSQL, OpenAI or Docling needed |
+| **Tests** | 31 — API handlers with stubbed database functions and a fake agent; settings and input bounds; the ingestion pipeline with a fake extractor (3 tests need the `ingest` extra and run in their own CI job). No PostgreSQL, OpenAI or Docling needed |
 | **CI** | ruff · `ruff format --check` · mypy · pytest · an import-with-no-secrets check · the ingest-extra tests · bandit · pip-audit · gitleaks · container: non-root image started against pgvector, migrates, `/health` true, 401 without the key, 200 with it |
 
 ## Architecture
@@ -133,6 +133,7 @@ uv run pytest -q && uv run ruff check . && uv run mypy agent
 | 13 | A global `filterwarnings("ignore")` at import; compose published PostgreSQL on the host with password `postgres` | Hidden warnings; an exposed database |
 | 14 | No tests, no CI | Nothing checked anything |
 | 15 | `docker-compose.override.yml` (auto-loaded) mounted the tree over `/app` and ran a bare `uvicorn` | Every `docker compose up` started an API container that died with *executable file not found*; the override is an explicit `docker-compose.dev.yml` now |
+| 16 | A missing `OPENAI_API_KEY` surfaced from `/chat` as a 502 *The agent could not process the request* | The container probe showed the only clue was in the log; a `ConfigurationError` is a 503 *The model provider is not configured* on `/chat` and `/chat/stream` now |
 
 ## Design notes
 
