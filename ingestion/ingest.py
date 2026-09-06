@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -165,7 +166,7 @@ class DocumentIngestionPipeline:
         )
 
     async def ingest_documents(
-        self, progress_callback: callable | None = None
+        self, progress_callback: Callable[[int, int], None] | None = None
     ) -> list[IngestionResult]:
         """
         Ingest all documents from the documents folder with  processing.

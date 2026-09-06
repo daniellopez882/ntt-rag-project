@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
-    APP_HOST: str = "0.0.0.0"  # noqa: S104 - a server bind address
+    APP_HOST: str = "0.0.0.0"  # noqa: S104  # nosec B104 - bound inside a container
     APP_PORT: int = Field(default=8058, ge=1, le=65535)
 
     # Callers must send this in X-API-Key. Empty means every route but /health

@@ -50,7 +50,8 @@ class DatabasePool:
         """Acquire a connection from the pool."""
         if not self.pool:
             await self.initialize()
-        assert self.pool is not None
+        if self.pool is None:  # initialize() sets it or raises
+            raise RuntimeError("the database pool is not initialised")
         async with self.pool.acquire() as connection:
             yield connection
 
