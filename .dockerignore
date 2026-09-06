@@ -1,8 +1,16 @@
 .git
+.github
 .venv
+.venv312
 __pycache__
 *.pyc
 *.log
 .env
-.pytest_cache/
+.pytest_cache
+.mypy_cache
+.ruff_cache
 .DS_Store
+tests
+docs
+documents
+*.md

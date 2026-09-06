@@ -1,106 +1,108 @@
-import streamlit as st
-import requests
-import aiohttp
+"""Streamlit chat client for the API.
+
+Sends the API key the server now requires, and keeps the API URL fixed to
+configuration: the old sidebar let anyone point this server-side client at
+any URL, which made the UI container a request proxy.
+"""
+
 import asyncio
 import json
-from dotenv import load_dotenv
 import os
+
+import aiohttp
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+
 load_dotenv()
 
-# Application configuration
-APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", 8000))
-
-API_URL = os.getenv("API_URL", f"http://localhost:{APP_PORT}")
+API_URL = os.getenv("API_URL") or f"http://localhost:{os.getenv('APP_PORT', '8058')}"
+API_KEY = os.getenv("API_KEY", "")
+USER_ID = os.getenv("UI_USER_ID", "ui")
+HEADERS = {"X-API-Key": API_KEY}
 
 st.set_page_config(page_title="Agentic RAG", page_icon="🤖", layout="wide")
-USER_ID = "user"
 
-# Session state init
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Health check
-def check_health(base_url: str):
-    try:
-        resp = requests.get(f"{base_url}/health", timeout=5)
-        if resp.status_code == 200:
-            return True
-        return False
-    except Exception:
-        return False
 
-async def stream_chat(message: str, base_url: str):
-    request_data = {
+def check_health() -> dict | None:
+    try:
+        resp = requests.get(f"{API_URL}/health", timeout=5)
+        return resp.json() if resp.status_code in (200, 503) else None
+    except Exception:
+        return None
+
+
+async def stream_chat(message: str) -> None:
+    payload = {
         "message": message,
         "session_id": st.session_state.session_id,
         "user_id": USER_ID,
-        "search_type": "hybrid"
+        "search_type": "hybrid",
     }
-
-    response_box = st.empty()
+    box = st.empty()
     full_response = ""
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f"{base_url}/chat/stream", json=request_data) as resp:
-            async for line in resp.content:
-                line = line.decode("utf-8").strip()
+    async with aiohttp.ClientSession(headers=HEADERS) as session:  # noqa: SIM117
+        async with session.post(f"{API_URL}/chat/stream", json=payload) as resp:
+            if resp.status != 200:
+                detail = (await resp.json()).get("detail", resp.reason)
+                box.error(f"API error {resp.status}: {detail}")
+                return
+            async for raw in resp.content:
+                line = raw.decode("utf-8").strip()
                 if not line.startswith("data: "):
                     continue
-
                 try:
                     data = json.loads(line[6:])
                 except json.JSONDecodeError:
                     continue
-
-                if data.get("type") == "session":
+                kind = data.get("type")
+                if kind == "session":
                     st.session_state.session_id = data.get("session_id")
-
-                elif data.get("type") == "text":
-                    content = data.get("content", "")
-                    full_response += content
-                    response_box.write(full_response)
-                    
-                elif data.get("type") == "tools":
-                    tools = data.get("tools", [])
-                    for tool in tools:
-                        tool_name = tool.get("tool_name", "")
-                        tool_args = tool.get("args", {})
-                        full_response += f"\n [Tool: {tool_name}] \n Args: {tool_args}"
-                    response_box.write(full_response)
-                    
-                elif data.get("type") == "end":
+                elif kind == "text":
+                    full_response += data.get("content", "")
+                    box.write(full_response)
+                elif kind == "tools":
+                    for tool in data.get("tools", []):
+                        full_response += (
+                            f"\n\n[Tool: {tool.get('tool_name', '')}] args: {tool.get('args', {})}"
+                        )
+                    box.write(full_response)
+                elif kind == "error":
+                    box.error(data.get("content", "The agent failed"))
+                    return
+                elif kind == "end":
                     break
-
-    response_box.write(full_response)
+    box.write(full_response)
     st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-def run_async(message: str, base_url: str):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(stream_chat(message, base_url))
 
-# Sidebar
+def run_async(message: str) -> None:
+    asyncio.run(stream_chat(message))
+
+
 with st.sidebar:
     st.header("Settings")
-    base_url = st.text_input("API URL", value=API_URL)
-
-    if st.button("Check Health"):
-        if check_health(base_url):
+    st.caption(f"API: {API_URL}")
+    if not API_KEY:
+        st.warning("API_KEY is not set; requests will be rejected.")
+    if st.button("Check health"):
+        health = check_health()
+        if health and health.get("status") == "healthy":
             st.success("API is healthy")
+        elif health:
+            st.error(f"API is {health.get('status')}: database={health.get('database')}")
         else:
             st.error("API not reachable")
-
-    if st.button("Clear Chat"):
+    if st.button("Clear chat"):
         st.session_state.messages = []
         st.session_state.session_id = None
         st.rerun()
-    
-    st.divider()
 
-# Main chat
 st.title("Agentic RAG")
 
 for msg in st.session_state.messages:
@@ -108,11 +110,8 @@ for msg in st.session_state.messages:
         st.write(msg["content"])
 
 if prompt := st.chat_input("Ask something..."):
-    # Show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            run_async(prompt, base_url)
+    with st.chat_message("assistant"), st.spinner("Thinking..."):
+        run_async(prompt)

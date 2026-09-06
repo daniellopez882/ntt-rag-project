@@ -1,0 +1,16 @@
+# Development overlay: hot reload with the source mounted in.
+# Opt in explicitly; as `docker-compose.override.yml` it was applied to every
+# `docker compose up`, mounted the whole tree over /app (hiding the image's
+# virtualenv) and ran a bare `uvicorn` that the container could not find.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+services:
+  api:
+    volumes:
+      - ./agent:/app/agent:ro
+      - ./sql:/app/sql:ro
+    command: ["sh", "-c", "uvicorn agent.api:app --host 0.0.0.0 --port 8058 --reload"]
+
+  ui:
+    volumes:
+      - ./ui:/app/ui:ro

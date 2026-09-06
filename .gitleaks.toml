@@ -1,0 +1,15 @@
+# gitleaks configuration
+#
+# The default `curl-auth-header` rule flags the container job's probe:
+#   curl -H 'X-API-Key: ci-api-key' http://127.0.0.1:8058/documents
+# `ci-api-key` is the throwaway value the same workflow writes into the
+# compose environment a few lines above, so that the job can assert the API
+# answers 401 without it and 200 with it. Only that literal is allowlisted, so
+# any other secret anywhere in the repository still fails the security job.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "The container job's throwaway API key, set in the same workflow"
+regexes = ['''ci-api-key''']
