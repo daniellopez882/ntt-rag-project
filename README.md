@@ -134,6 +134,7 @@ uv run pytest -q && uv run ruff check . && uv run mypy agent
 | 14 | No tests, no CI | Nothing checked anything |
 | 15 | `docker-compose.override.yml` (auto-loaded) mounted the tree over `/app` and ran a bare `uvicorn` | Every `docker compose up` started an API container that died with *executable file not found*; the override is an explicit `docker-compose.dev.yml` now |
 | 16 | A missing `OPENAI_API_KEY` surfaced from `/chat` as a 502 *The agent could not process the request* | The container probe showed the only clue was in the log; a `ConfigurationError` is a 503 *The model provider is not configured* on `/chat` and `/chat/stream` now |
+| 17 | Five dependencies with published advisories: `starlette`, `idna`, `python-dotenv`, `click`, and `pydantic-ai-slim` pinned `<1` | CI's `pip-audit` found them the first time it ran on GitHub. All five are on fixed releases now; the pydantic-ai move from 0.7.6 to 1.x was checked against a real `Agent` with a live model object, not only against the suite's stub |
 
 ## Design notes
 

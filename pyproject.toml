@@ -9,13 +9,17 @@ license = { text = "MIT" }
 # it used to be installed into every image, including the API's.
 dependencies = [
     "asyncpg>=0.30.0",
-    "fastapi>=0.116.1",
+    "fastapi>=0.141.1",           # starlette >= 1.1 needs a recent FastAPI
+    "starlette>=1.1.0",           # PYSEC-2026-2280, PYSEC-2026-2281
+    "idna>=3.15",                 # PYSEC-2026-215
+
     "uvicorn[standard]>=0.30.0",
     "pydantic>=2.11",
     "pydantic-settings>=2.4",
-    "pydantic-ai-slim[openai]>=0.7.6,<1",
+    "pydantic-ai-slim[openai]>=1.56.0,<2",  # PYSEC-2026-2980
+    "click>=8.3.3",               # PYSEC-2026-2132
     "openai>=1.101.0",
-    "python-dotenv>=1.0.1",
+    "python-dotenv>=1.2.2",       # PYSEC-2026-2270
     "httpx>=0.28.1",
     "anyio>=4.10.0",
 ]
